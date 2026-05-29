@@ -161,7 +161,7 @@
 | `<host>` | the VPS address/alias your controller uses to SSH in | all `[LOCAL]` commands |
 | `<key>` | the private-key path your controller authenticates with | `[LOCAL]` login verifies |
 | `<admin-user>` | the verified non-root sudo user from the §1 non-root sudo user step | A2 `AllowGroups` (member of `sshusers`) |
-| `CLIENT_IP` / `<ADMIN_IP_OR_CIDR>` | `echo "$SSH_CONNECTION" \| awk '{print $1}'` (your controller's IP) | A3 `ignoreip` |
+| `CLIENT_IP` / `<ADMIN_IP_OR_CIDR>` | `echo "$SSH_CONNECTION" \| awk '{print $1}'` (your controller's IP) | A3 `ignoreip`, A2 PerSourcePenaltyExemptList |
 | `<iface>` | egress NIC from §2 default-route detect | A4 netplan, firewall |
 | `<MAC>` | `cat /sys/class/net/<iface>/address` (or `ip link show <iface>`) | A4 netplan match |
 | `<SERVER_PUBLIC_IPV4>` / `_IPV6` | `ip -4 addr show <iface>` / `ip -6 ...`; if the public IP is NAT'd and not on the NIC, query the provider metadata or `curl -s https://api.ipify.org` (note: do this BEFORE any egress-blocking firewall) | A3 `ignoreip` |
@@ -274,7 +274,16 @@ Run the **Interview (§I)** in parallel with A2–A7 (the A8 reboot after A1 is 
   PubkeyAcceptedAlgorithms sk-ssh-ed25519-cert-v01@openssh.com,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,ssh-ed25519,rsa-sha2-512,rsa-sha2-256
   CASignatureAlgorithms sk-ssh-ed25519@openssh.com,ssh-ed25519,rsa-sha2-512,rsa-sha2-256
   RequiredRSASize 3072
+  LogLevel VERBOSE                   # CIS 5.2.5; logs key fingerprint on auth — negligible overhead
+  DisableForwarding yes              # umbrella: disables all forwarding (TCP/X11/StreamLocal/agent). [24.04] CVE-2025-32728: X11+agent forwarding leak through on <10.0 — add explicit AllowAgentForwarding no and X11Forwarding no as workaround
+  AllowAgentForwarding no            # [24.04] workaround for CVE-2025-32728; redundant on 10.0+ but harmless
+  X11Forwarding no                   # [24.04] same workaround; 10.0+ DisableForwarding covers this
+  MaxStartups 10:30:60               # 10 unauthenticated allowed, then 30% drop, hard cap 60 (default 10:30:100)
+  PerSourcePenalties authfail:30 noauth:15 grace-exceeded:120
+  PerSourcePenaltyExemptList <ADMIN_IP_OR_CIDR>   # RESOLVE before writing — see placeholder table; if dynamic/unknown, OMIT this line entirely
   ```
+  - **[24.04] Remove `PerSourcePenalties` and `PerSourcePenaltyExemptList` from 99-hardening.conf — OpenSSH 9.6p1 does not support them; `sshd -t` will reject the config.** **PerSourcePenalties (OpenSSH ≥9.8, default ON):** native sshd-level rate limiting — complements fail2ban (different layer: sshd refuses connections vs nftables drops packets). Tune explicitly; exempt the admin IP via `PerSourcePenaltyExemptList` or repeated auth failures during verify steps trigger self-penalty. Space-separated syntax, NOT commas: `authfail:30 noauth:15 grace-exceeded:120`. `PerSourcePenaltyExemptList` takes comma-separated CIDRs.
+  - **Phase B tunnel override:** `DisableForwarding yes` blocks SSH tunnels/agent forwarding. Phase B modules needing `ssh -L`/`-D`/`-A` must add a higher-numbered drop-in (e.g. `98-forwarding.conf`) with `AllowTcpForwarding yes` or selective `PermitOpen`.
   - **`AllowGroups sshusers` — create the group and add the admin user BEFORE the reload, or you lock everyone out.** A group is the maintainable form of the whitelist: adding an operator becomes a `usermod`, not an sshd edit + reload (a lockout-capable action). Before reloading: `sudo groupadd -f sshusers && sudo usermod -aG sshusers <admin-user>`. Skip-if the group already exists, contains the admin user, and `99-hardening.conf` already uses `AllowGroups sshusers`. Verify: `id <admin-user>` lists `sshusers` and `sudo sshd -T | grep -i allowgroups` shows `allowgroups sshusers`; confirm a fresh `[LOCAL]` key login as `<admin-user>` in a second session before closing the current one (lockout-capable — same discipline as the rest of §A2). Rollback: keep the prior `AllowUsers <admin-user>` drop-in; on `sshd -t` failure do not reload.
   - **`@openssh.com` suffix on all three MACs is MANDATORY** — without it sshd rejects with `Bad SSH2 mac spec` and won't start (lockout).
   - **KexAlgorithms:** 6 entries on 9.6p1 (24.04); 7 on 10.x (24.04 set + `mlkem768x25519-sha256` FIRST). Do NOT add `ext-info-s`/`kex-strict-s-v00@openssh.com` (protocol markers, not config tokens — break sshd) or `gss-*` (GSSAPIKexAlgorithms only). Verify every token exists: `ssh -Q kex`.
@@ -374,6 +383,9 @@ net.ipv4.tcp_syncookies = 1
 # Behavior
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
+# VM writeback tuning (prevents I/O storms on virtual disks)
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
 ```
 - **do NOT set `rmem_default`/`wmem_default = 2MB`** — TCP ignores them (uses tcp_rmem/tcp_wmem autotuning) and 2 MB inflates per-socket RAM. Leave the 212992 default.
 - **16 MiB, not 64 MiB**, for a small VPS. Raise `rmem_max`/`wmem_max` to `67108864` ONLY in a confirmed long-fat-network module (10G, ≥100 ms RTT).
@@ -391,6 +403,12 @@ net.ipv4.tcp_mtu_probing = 1
   ```
   Persist module: `echo tcp_bbr | sudo tee /etc/modules-load.d/bbr.conf`. Verify: `sysctl net.ipv4.tcp_available_congestion_control` lists `bbr` AND `...tcp_congestion_control` shows `bbr`.
   - **[INFO]** `default_qdisc=fq` only applies to interfaces brought up AFTER the sysctl runs; a NIC already up at boot (e.g. `net0`) keeps `pfifo_fast`. BBR works regardless on kernel 7.0 (the `fq` pacing requirement was a BBRv1-era concern), so this is cosmetic. If you want `fq` on the live NIC now: `sudo tc qdisc replace dev <iface> root fq` (or `netplan`/ifreload).
+- **I/O scheduler — `none` for virtio disks (host already schedules I/O).** Detect: `cat /sys/block/vda/queue/scheduler`; if virtio (`vd*`), persist via udev:
+  ```
+  # /etc/udev/rules.d/60-io-scheduler.rules
+  ACTION=="add|change", KERNEL=="vd[a-z]*", ATTR{queue/scheduler}="none"
+  ```
+  Apply: `sudo udevadm control --reload-rules && sudo udevadm trigger`. Immediate: `echo none | sudo tee /sys/block/vda/queue/scheduler`. Skip if disk is not virtio. Marginal gain (<2%) but zero risk.
 - **MTU detect — OPTIONAL; measure path MTU, never hardcode a fixed value. Default-skip (leave link MTU) if you cannot measure — a wrong MTU can break connectivity after `netplan apply`.**
   - Target: use a stable off-link anchor — the default gateway (`ip route | awk '/default/{print $3}'`) or `1.1.1.1`. Only run this if you have a reason to (provider known to clip MTU); otherwise SKIP and keep the default.
   - Measure: `tracepath -n <target>` → final `pmtu N`; confirm via DF-ping (`ping -M do -s 1472 -c2 <target>`, lower `-s` until success; MTU = payload + 28). If unmeasurable, SKIP — do not guess.
@@ -452,11 +470,20 @@ net.ipv4.conf.default.rp_filter = 1            # default needed or hotplug NICs 
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
+kernel.sysrq = 0                   # disable magic SysRq (no physical console on VPS; default 176)
+kernel.core_pattern = |/bin/false
 ```
+- **Core dump lockdown (CIS 1.5.3):** `fs.suid_dumpable=0` (above) blocks SUID binaries only. Add to the A5 sysctl block to block ALL core dumps:
+  ```
+  kernel.core_pattern=|/bin/false
+  ```
+  (`systemd-coredump` is not installed by default on 24.04/26.04 server — the sysctl is the load-bearing control. If `systemd-coredump` is later installed, also write `/etc/systemd/coredump.conf.d/99-disable.conf` with `Storage=none` + `ProcessSizeMax=0`.)
+  Verify: `sysctl kernel.core_pattern` shows `|/bin/false`; `kill -ABRT <sleep-pid>` produces no core file.
 - After apply: `sudo sysctl -w net.ipv4.route.flush=1; sudo sysctl -w net.ipv6.route.flush=1`.
 - **`rp_filter=1` is lockout-capable (can sever an asymmetric-routed session) and A5 has NO auto-rollback — the open session is the sole net (as in A2).** Arm a LIVE kernel revert (a `sed`+`sysctl --system` revert silently no-ops if the value/format differs): `sudo systemd-run --on-active=300 --unit=rpf-revert sh -c 'sysctl -w net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.default.rp_filter=2 net.ipv4.route.flush=1'`, apply, then do a fresh `[LOCAL]` session check; cancel the timer (`systemctl stop rpf-revert.timer`) only after it succeeds. (Value 2 = loose; the kernel uses max(all, per-interface) so 2 overrides any 1 on existing NICs.) Keep the file-edit `sed -i 's/rp_filter = 1/rp_filter = 2/' /etc/sysctl.d/99-zz-kernel-harden.conf` only as a SECONDARY persistence step, not the load-bearing revert.
 - **Decision rule (do NOT agent-judge):** universal default = `1`. Use `2` (loose) ONLY if a collected interview answer says the host is multi-uplink/BGP/policy-routed/VPN. No answer ⇒ keep `1`; never infer from topology.
 - **kexec lockdown — context-dependent, NOT universal:** `kernel.kexec_load_disabled = 1` only on hosts WITHOUT kdump/Livepatch (one-way until reboot; breaks crash-dump capture).
+- **Transparent Huge Pages = `madvise`** (consensus 2025: Redis, PostgreSQL, MongoDB, Oracle all recommend `madvise` over the default `always` which causes latency spikes on small VPS). Skip-if: `cat /sys/kernel/mm/transparent_hugepage/enabled` already shows `[madvise]`. Persist via kernel cmdline: `grep -q transparent_hugepage /etc/default/grub || sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 transparent_hugepage=madvise"/' /etc/default/grub && sudo update-grub`. Immediate (pre-reboot): `echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled`. Verify: `cat /sys/kernel/mm/transparent_hugepage/enabled` shows `[madvise]`. Rollback: remove `transparent_hugepage=madvise` from `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, run `sudo update-grub`, reboot.
 - **IP forwarding:** universal leaves `net.ipv4.ip_forward = 0` (do NOT set). VPN/relay module only sets `=1` — and **toggling ip_forward re-initializes IPv4 per-interface params to RFC1122 host / RFC1812 router defaults**, so in that module set `ip_forward` FIRST, then re-apply rp_filter/redirects.
 
 ## A6 — System maintenance
@@ -475,6 +502,12 @@ net.ipv4.conf.default.log_martians = 1
   $nrconf{restart} = 'a';
   EOF
   ```
+- **systemd DefaultLimitNOFILE** — default soft limit 1024 is too low for services handling many connections (web servers, proxies, databases). Write `/etc/systemd/system.conf.d/limits.conf`:
+  ```
+  [Manager]
+  DefaultLimitNOFILE=65536:524288
+  ```
+  Apply: `sudo systemctl daemon-reexec`. Affects systemd-managed services only (not login shells). Verify: restart any service, check `cat /proc/<pid>/limits | grep 'Max open files'`.
 - **time sync:** `timedatectl status` → "System clock synchronized: yes" / "NTP service: active"; if off `sudo timedatectl set-ntp true`. If chrony installed, disable timesyncd (never both).
 - **AppArmor:** verify, do not disable — `sudo aa-status` shows profiles loaded/enforce. No `apparmor=0` in GRUB; don't mask the service.
 
@@ -492,6 +525,30 @@ Minimal Ubuntu uses `systemd-resolved` on `127.0.0.53` with no DNSSEC validation
   then `sudo systemctl restart systemd-resolved`. (`allow-downgrade`/`opportunistic`, NOT `yes` — strict `yes` breaks on captive portals and resolvers without DoT. Raise to `yes` only when you control the upstream resolver.)
 - **Verify → Expected:** `resolvectl status` shows the values on the link; `resolvectl query example.com` still resolves.
 - **Rollback:** remove the drop-in, restart `systemd-resolved`.
+
+## A6.7 — Memory management (ZRAM + earlyoom)
+
+Universal baseline — zero overhead on large VPS, critical on 1-2 GB.
+
+- **ZRAM compressed swap** — effectively doubles usable memory via zstd compression (~4:1 ratio).
+  - **Skip-if:** `/dev/zram0` already in `swapon --show` with zstd AND `sysctl vm.swappiness` = 180.
+  Install: `sudo apt-get install -y systemd-zram-generator`. Write `/etc/systemd/zram-generator.conf`:
+  ```
+  [zram0]
+  zram-size = ram / 2
+  compression-algorithm = zstd
+  ```
+  Tune swappiness for in-memory swap — write `/etc/sysctl.d/99-zram.conf`:
+  ```
+  vm.swappiness = 180
+  vm.page-cluster = 0
+  ```
+  (180 = Fedora/Pop!_OS default for zram — high swappiness is correct when swap is RAM-speed, not disk. `page-cluster=0` minimizes zstd decompression latency.)
+  **Disable disk swap** if present: `sudo swapoff -a`, `sudo sed -i '/\sswap\s/s/^/#/' /etc/fstab`. Do NOT run zram alongside disk swap (zram fills RAM with cold pages, pushes active set to slow disk).
+  Start: `sudo systemctl daemon-reload && sudo systemctl start systemd-zram-setup@zram0.service`. Apply sysctl: `sudo sysctl --system`.
+  Verify: `swapon --show` → `/dev/zram0` with zstd; `zramctl` shows size/algorithm; `free -h` shows swap; `sysctl vm.swappiness` → 180.
+  - **Rollback ZRAM:** `sudo swapoff /dev/zram0; sudo systemctl stop systemd-zram-setup@zram0.service; sudo apt-get purge -y systemd-zram-generator; sudo rm -f /etc/systemd/zram-generator.conf /etc/sysctl.d/99-zram.conf; sudo sysctl --system`. Rollback earlyoom: `sudo apt-get purge -y earlyoom`.
+- **earlyoom** — kills lowest-priority process before kernel OOM killer (faster, more predictable). `sudo apt-get install -y earlyoom`. Default: SIGTERM at mem≤10%+swap≤10%, SIGKILL at 5%+5%. Respects `oom_score_adj` — sshd/systemd safe. Verify: `systemctl is-active earlyoom` → active; `journalctl -u earlyoom -n3` shows monitoring. Skip-if: `systemd-oomd` is active (desktop images — not typical on server).
 
 ## A7 — Cleanup (headless/virtualized; ALWAYS dry-run before purge)
 
@@ -766,3 +823,11 @@ Read the workload + any module knobs from `/root/vps-workload.conf` (written in 
 | Egress (if restrictive) | `apt-get update`; `curl --max-time 5 http://<host>:4444` | apt works; high-port egress times out |
 | Module blacklist | `modprobe -n -v dccp` | `install /bin/true` |
 | Mount hardening | `findmnt /dev/shm` | `nodev,nosuid,noexec`; apt installs |
+| PerSourcePenalties | `sudo sshd -T \| grep persourcepenalt` | configured values shown (26.04 only) |
+| ZRAM | `swapon --show`; `zramctl` | `/dev/zram0` with zstd; `vm.swappiness` = 180 |
+| earlyoom | `systemctl is-active earlyoom` | active |
+| THP | `cat /sys/kernel/mm/transparent_hugepage/enabled` | `[madvise]` |
+| Core dump blocked | `sysctl kernel.core_pattern` | `\|/bin/false` |
+| I/O scheduler | `cat /sys/block/vda/queue/scheduler` | `[none]` (virtio) |
+| DefaultLimitNOFILE | `cat /proc/1/limits \| grep 'Max open files'` | 65536 / 524288 |
+| DNS hardening | `resolvectl status` | DNSOverTLS=opportunistic; DNSSEC=allow-downgrade |
