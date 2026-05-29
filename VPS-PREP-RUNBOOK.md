@@ -141,6 +141,19 @@
   - v4/v6 egress differ, or multiple non-loopback default/ECMP NICs (multi-NIC, bonded, policy-routed) → do NOT auto-pick; abort, require operator to name the interface. (Client-IP routing can pick a non-egress NIC under asymmetric routing and still pass a non-empty check → lockout.)
 - **Existing firewall owner (judge the FIREWALL, not the unit):** `ufw status` (NOT `systemctl is-active ufw`) is the truth for whether the firewall enforces — `ufw.service` can report `active` (loaded) while `ufw status` = `inactive` and iptables empty default-ACCEPT. Run `ufw status verbose; systemctl is-active firewalld nftables; iptables -S; nft list ruleset`; decide owner from `ufw status` / actual rules. Commit to ONE owner (see §A1).
 - **Resources / inventory:** RAM & disk (`free -m`, `df -h`, `lsblk`), installed packages (drives §A7 skip-ifs), `/boot` free space (≥1 GB for kernel upgrades).
+- **Network baseline (before tuning):** measure throughput BEFORE A4 applies BBR/buffer changes — without this, A4's benefit is unverifiable. Save to `/root/net-baseline.txt`:
+  ```sh
+  echo "=== PRE-TUNING BASELINE ===" > /root/net-baseline.txt
+  echo "congestion_control: $(sysctl -n net.ipv4.tcp_congestion_control)" >> /root/net-baseline.txt
+  echo "rmem_max: $(sysctl -n net.core.rmem_max)" >> /root/net-baseline.txt
+  echo "wmem_max: $(sysctl -n net.core.wmem_max)" >> /root/net-baseline.txt
+  echo "qdisc: $(sysctl -n net.core.default_qdisc)" >> /root/net-baseline.txt
+  for url in https://proof.ovh.net/files/10Mb.dat http://speedtest.tele2.net/10MB.zip; do
+    echo "download $url:" >> /root/net-baseline.txt
+    curl -o /dev/null -s -w "  speed=%{speed_download} bytes/s  time=%{time_total}s\n" "$url" >> /root/net-baseline.txt
+  done
+  cat /root/net-baseline.txt
+  ```
 
 ### Placeholder → source (resolve ALL before first use; never write a literal `<...>` into a config)
 | Placeholder | How to obtain | Used in |
@@ -392,7 +405,20 @@ net.ipv4.tcp_mtu_probing = 1
           mtu: <measured>
     ```
   - Apply: `sudo netplan try` (auto-reverts in 120 s) then `sudo netplan apply`; verify `ip link show <iface>`.
-- **Speed test — optional diagnostic only.** Prefer `curl -o /dev/null -s -w 'down=%{speed_download} B/s\n' https://<large-file-url>` (×8 = bits/s) or `iperf3 -c <peer> -J`. Do NOT invoke the Ookla Speedtest CLI interactively (first-run EULA hangs an unattended agent); if required: `speedtest --accept-license --accept-gdpr -f json`.
+- **Post-tuning benchmark — compare against §2 baseline.** Append to `/root/net-baseline.txt`:
+  ```sh
+  echo "" >> /root/net-baseline.txt
+  echo "=== POST-TUNING (BBR + 16M buffers) ===" >> /root/net-baseline.txt
+  echo "congestion_control: $(sysctl -n net.ipv4.tcp_congestion_control)" >> /root/net-baseline.txt
+  echo "rmem_max: $(sysctl -n net.core.rmem_max)" >> /root/net-baseline.txt
+  echo "qdisc: $(sysctl -n net.core.default_qdisc)" >> /root/net-baseline.txt
+  for url in https://proof.ovh.net/files/10Mb.dat http://speedtest.tele2.net/10MB.zip; do
+    echo "download $url:" >> /root/net-baseline.txt
+    curl -o /dev/null -s -w "  speed=%{speed_download} bytes/s  time=%{time_total}s\n" "$url" >> /root/net-baseline.txt
+  done
+  cat /root/net-baseline.txt
+  ```
+  Compare PRE vs POST speeds. BBR + larger buffers should show equal or better throughput (especially on high-latency links). If POST is slower — investigate: wrong MTU, packet loss, or provider QoS. Do NOT keep tuning that degrades throughput; revert the specific knob. Do NOT invoke the Ookla Speedtest CLI interactively (first-run EULA hangs an unattended agent); if required: `speedtest --accept-license --accept-gdpr -f json`.
 
 ## A5 — Kernel hardening (`/etc/sysctl.d/99-zz-kernel-harden.conf` — the `zz` prefix sorts AFTER distro `99-protect-links.conf`/`50-default.conf`, else `fs.protected_*` / redirects are silently re-overridden)
 
@@ -490,7 +516,8 @@ Minimal Ubuntu uses `systemd-resolved` on `127.0.0.53` with no DNSSEC validation
 - `sudo apt-get -y purge apport apport-symptoms whoopsie` (optionally `ubuntu-report popularity-contest`). Install `systemd-coredump` if you still want post-mortem dumps.
 - `sudo apt-get purge -y sysstat`. To keep tools, set `ENABLED="false"` in `/etc/default/sysstat` + disable the timers (the systemd `sysstat-collect.timer` is NOT gated by `ENABLED=false` — that flag gates the cron/SA1 path; the timer is a separate unit, compounded by first-boot presets, LP #2066117 — confirm stopped).
 - **Autoremove safety — guard cloud-init/kernel:** `sudo apt-mark manual cloud-init netplan.io software-properties-common` FIRST (autoremove only targets `auto`-flagged packages; `manual` protects them without blocking security updates — unlike `hold`, which silently excludes the package from unattended-upgrades). Dry-run `sudo apt-get -s autoremove --purge`, inspect the Remv/Purg list, match against `uname -r` (a manually-booted old kernel can be removed). Only then run for real.
-  - **[26.04] `--auto-remove` cascades WIDE — review the dry-run, it removes more than you target.** On 26.04 the packagekit/apport purges + autoremove can pull in: `ubuntu-server` (metapackage), `jq`, `software-properties-common` (⇒ no more `add-apt-repository`), `appstream`, `modemmanager`/`libqmi`/`libmbim`, and `ufw`. If you need any of these, `sudo apt-mark manual <pkg>` BEFORE the purge (or reinstall after, from the log). (software-properties-common is marked manual in the guard above; on 26.04 it is still pulled by the packagekit purge cascade despite the flag — verify it survives, reinstall if not: `sudo apt-get install -y software-properties-common`) Always read the simulated set first; never blind-run `purge --auto-remove`.
+  Guard for absent packages: `for pkg in cloud-init netplan.io software-properties-common; do dpkg -l "$pkg" 2>/dev/null | grep -q '^ii' && sudo apt-mark manual "$pkg"; done` (skips packages not installed — `apt-mark manual` on an absent package errors on some 26.04 images).
+  - **[26.04] `--auto-remove` cascades WIDE — review the dry-run, it removes more than you target.** On 26.04 the packagekit/apport purges + autoremove can pull in: `ubuntu-server` (metapackage), `jq`, `software-properties-common` (⇒ no more `add-apt-repository`), `appstream`, `modemmanager`/`libqmi`/`libmbim`, and `ufw`. If you need any of these, `sudo apt-mark manual <pkg>` BEFORE the purge (or reinstall after, from the log). (software-properties-common is marked manual in the guard above; on 26.04 it is still pulled by the packagekit purge cascade despite the flag — verify it survives, reinstall if not: `sudo apt-get install -y software-properties-common`) Similarly verify cloud-init: `dpkg -l cloud-init 2>/dev/null | grep -q '^ii' && sudo apt-mark manual cloud-init || true` (the base package may only exist as `cloud-initramfs-*` variants on some images). Always read the simulated set first; never blind-run `purge --auto-remove`.
 - **[OPTIONAL] snapd:** snapd is not purged on the universal baseline; on a minimal headless VPS it's usually dead weight (the `snapd` daemon + `snap-repair.timer`). If no workload needs snaps: `sudo systemctl disable --now snapd.socket snapd.service snapd.seeded.service 2>/dev/null; sudo apt-get purge -y snapd && sudo apt-get autoremove -y` (log purged set per the top note). Skip if snaps are in use.
 - `sudo apt-get clean` and `sudo journalctl --vacuum-size=500M` (matches the §A6 `SystemMaxUse=500M` cap — a one-time trim below the cap just churns back up; the suffix is REQUIRED — bare `--vacuum-size` errors).
 - **Reset failed units — clear stale failed units after purge.** Purging a service (e.g. `apport.service`, `multipathd-queueing.service`) leaves it in `systemctl --failed` as `not-found`, which makes the §V "no new failed units" check FALSE-fail. After purges run: `sudo systemctl reset-failed` (or target specific units: `sudo systemctl reset-failed apport.service multipathd-queueing.service`). Then re-check `systemctl --failed` is clean.
